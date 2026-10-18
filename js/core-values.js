@@ -1,0 +1,197 @@
+import {
+  CORE_FIELDS,
+  EPISODE_AIGIS_PARTY_MEMBERS,
+  DIFFICULTIES,
+  DIFFICULTY_FLAG_MASK,
+  DIFFICULTY_WORD_INDEX,
+  PARTY_MEMBERS,
+  PLAYER_FULL_NAME_INDEX,
+  PLAYER_NAME_BUFFER_WORD_COUNT,
+  PLAYER_NAME_FIELDS,
+  PLAYER_NAME_MAX_LENGTH,
+  PLAY_TIME_TICKS_PER_SECOND,
+  SOCIAL_LINKS,
+  SOCIAL_STATS,
+  VERSION_INDEX_OFFSET,
+} from "./constants.js";
+
+export function versionedIndex(save, versionOneIndex) {
+  return versionOneIndex + VERSION_INDEX_OFFSET[save.version];
+}
+
+export function getCoreValues(save) {
+  return Object.fromEntries(
+    Object.entries(CORE_FIELDS).map(([key, field]) => {
+      const storedValue = save.getWord(versionedIndex(save, field.index));
+      const value = key === "playTime"
+        ? Math.floor(storedValue / PLAY_TIME_TICKS_PER_SECOND)
+        : storedValue;
+      return [key, value];
+    }),
+  );
+}
+
+export function setCoreValue(save, key, value) {
+  const field = CORE_FIELDS[key];
+  if (!field) throw new Error(`Unknown core value ${key}.`);
+  if (!Number.isInteger(value) || value < field.min || value > field.max) {
+    throw new Error(`${field.label} must be between ${field.min} and ${field.max}.`);
+  }
+  const storedValue = key === "playTime" ? value * PLAY_TIME_TICKS_PER_SECOND : value;
+  save.setWord(versionedIndex(save, field.index), storedValue);
+  if (key === "playTime") save.writeHeaderNumber("PlayTime", storedValue);
+}
+
+export function getDifficulty(save) {
+  const headerValue = save.readHeaderNumber("Difficulty", "UInt16Property", 2);
+  const gameplayFlag = save.getWord(DIFFICULTY_WORD_INDEX) & DIFFICULTY_FLAG_MASK;
+  const gameplayValue = DIFFICULTIES.find((difficulty) => difficulty.flag === gameplayFlag)?.id ?? null;
+  const validHeader = DIFFICULTIES.some((difficulty) => difficulty.id === headerValue);
+  return {
+    value: validHeader ? headerValue : gameplayValue,
+    headerValue,
+    gameplayValue,
+    synchronized: validHeader && headerValue === gameplayValue,
+  };
+}
+
+export function setDifficulty(save, value) {
+  const difficulty = DIFFICULTIES.find((entry) => entry.id === value);
+  if (!difficulty) throw new Error("Choose a supported difficulty.");
+
+  const currentWord = save.getWord(DIFFICULTY_WORD_INDEX);
+  const gameplayWord = (
+    (currentWord & ~DIFFICULTY_FLAG_MASK) | difficulty.flag
+  ) >>> 0;
+  save.writeHeaderNumber("Difficulty", value, "UInt16Property", 2);
+  save.setWord(DIFFICULTY_WORD_INDEX, gameplayWord);
+}
+
+function writePlayerNameBuffer(save, versionOneIndex, value) {
+  if (value.length >= PLAYER_NAME_BUFFER_WORD_COUNT * 4) {
+    throw new Error("The combined protagonist name is too long for the save format.");
+  }
+  for (let wordIndex = 0; wordIndex < PLAYER_NAME_BUFFER_WORD_COUNT; wordIndex += 1) {
+    let packed = 0;
+    for (let byteIndex = 0; byteIndex < 4; byteIndex += 1) {
+      const characterIndex = (wordIndex * 4) + byteIndex;
+      if (characterIndex < value.length) {
+        packed |= value.charCodeAt(characterIndex) << (byteIndex * 8);
+      }
+    }
+    save.setWord(versionedIndex(save, versionOneIndex + wordIndex), packed >>> 0);
+  }
+}
+
+export function setPlayerName(save, key, value) {
+  if (save.isEpisodeAigis) throw new Error("Name editing is not available for Episode Aigis.");
+  const field = PLAYER_NAME_FIELDS[key];
+  if (!field) throw new Error("Unknown protagonist name field.");
+  if (typeof value !== "string" || value.length < 1 || value.length > PLAYER_NAME_MAX_LENGTH) {
+    throw new Error(`${field.label} must contain 1 to ${PLAYER_NAME_MAX_LENGTH} characters.`);
+  }
+  if ([...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 0x20 || code > 0x7e;
+  })) {
+    throw new Error(`${field.label} can only use basic English letters, numbers, spaces, and punctuation.`);
+  }
+  if (!value.trim()) throw new Error(`${field.label} cannot be blank.`);
+
+  const names = save.getHeader();
+  names[key] = value;
+  save.writeHeaderByteString(field.headerName, value);
+  writePlayerNameBuffer(save, PLAYER_NAME_FIELDS.firstName.index, names.firstName);
+  writePlayerNameBuffer(save, PLAYER_NAME_FIELDS.lastName.index, names.lastName);
+  writePlayerNameBuffer(
+    save,
+    PLAYER_FULL_NAME_INDEX,
+    [names.firstName, names.lastName].filter(Boolean).join(" "),
+  );
+}
+
+export function getPartyMembers(save) {
+  if (!save.isEpisodeAigis) return PARTY_MEMBERS;
+  // Check the tagged primary unit blocks before using these offsets. Later
+  // sections contain additional copies that must not be mistaken for the party.
+  for (const member of EPISODE_AIGIS_PARTY_MEMBERS) {
+    const hp = versionedIndex(save, member.hp);
+    if (
+      save.getWord(hp - 6) !== 0x10100 + member.id - 1
+      || save.getWord(hp - 5) !== 3
+      || save.getWord(hp - 4) !== 0x2b4
+      || save.getWord(hp - 2) !== 1
+      || save.getWord(hp - 1) !== member.id
+    ) {
+      throw new Error(`The saved ${member.name} character record is not supported.`);
+    }
+  }
+  return EPISODE_AIGIS_PARTY_MEMBERS;
+}
+
+export function getParty(save) {
+  return getPartyMembers(save).map((member) => ({
+    ...member,
+    hp: save.getWord(versionedIndex(save, member.hp)),
+    sp: save.getWord(versionedIndex(save, member.sp)),
+    level: save.getWord(versionedIndex(save, member.level)) & 0xffff,
+    experience: save.getWord(versionedIndex(save, member.experience)),
+  }));
+}
+
+export function setPartyValue(save, memberKey, field, value) {
+  const member = getPartyMembers(save).find((entry) => entry.key === memberKey);
+  if (!member || !["hp", "sp", "level", "experience"].includes(field)) {
+    throw new Error("Unknown party field.");
+  }
+  const ranges = {
+    hp: [0, 9999],
+    sp: [0, 9999],
+    level: [1, 99],
+    experience: [0, 9_999_999],
+  };
+  const [minimum, maximum] = ranges[field];
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${field} must be between ${minimum} and ${maximum}.`);
+  }
+  const index = versionedIndex(save, member[field]);
+  if (field === "level") {
+    const oldWord = save.getWord(index);
+    save.setWord(index, (oldWord & 0xffff0000) | value);
+    const leaderKey = save.isEpisodeAigis ? "aigis" : "protagonist";
+    if (member.key === leaderKey) save.writeHeaderNumber("PlayerLevel", value);
+  } else {
+    save.setWord(index, value);
+  }
+}
+
+export function getSocialData(save) {
+  return {
+    stats: SOCIAL_STATS.map((field) => ({
+      ...field,
+      value: save.getWord(versionedIndex(save, field.index)),
+    })),
+    links: SOCIAL_LINKS.map((link) => ({
+      ...link,
+      rank: save.getWord(versionedIndex(save, link.index)) & 0xff,
+    })),
+  };
+}
+
+export function setSocialStat(save, key, value) {
+  const field = SOCIAL_STATS.find((entry) => entry.key === key);
+  if (!field) throw new Error("Unknown social stat.");
+  if (!Number.isInteger(value) || value < 0 || value > 255) {
+    throw new Error("Social stat points must be between 0 and 255.");
+  }
+  save.setWord(versionedIndex(save, field.index), value);
+}
+
+export function setSocialLinkRank(save, versionOneIndex, rank) {
+  if (!Number.isInteger(rank) || rank < 0 || rank > 10) {
+    throw new Error("Social Link rank must be between 0 and 10.");
+  }
+  const index = versionedIndex(save, versionOneIndex);
+  const oldWord = save.getWord(index);
+  save.setWord(index, (oldWord & 0xffffff00) | rank);
+}
